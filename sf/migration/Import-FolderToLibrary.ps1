@@ -41,6 +41,10 @@
 .PARAMETER ExcludePattern
     除外するファイル名のワイルドカード。複数指定可。
 
+.PARAMETER IgnoreScanErrors
+    走査できないフォルダがあっても中断せず、読めた分だけ移行する。
+    既定では移行漏れを防ぐため中断する。
+
 .PARAMETER Force
     ライブラリ内の既存ファイル確認を省略し、同名ファイルがあっても再アップロードする。
     ContentVersion は insert のたびに別の ContentDocument になるため、指定するとファイルが重複する。
@@ -63,6 +67,7 @@ param(
     [int]      $MaxFileSizeMB = 37,
     [string[]] $ExcludePattern = @('Thumbs.db', '.DS_Store', 'desktop.ini'),
     [switch]   $Force,
+    [switch]   $IgnoreScanErrors,
     [switch]   $DryRun
 )
 
@@ -235,6 +240,49 @@ function Get-ApexMarker {
     return $out
 }
 
+function Split-Chunk {
+    # SOQL の IN 句が長くなりすぎないよう、ID の配列を一定数ずつに切る。
+    param([string[]]$Items, [int]$Size)
+    $chunks = @()
+    for ($i = 0; $i -lt $Items.Count; $i += $Size) {
+        $last = [math]::Min($i + $Size - 1, $Items.Count - 1)
+        $chunks += , @($Items[$i..$last])
+    }
+    return $chunks
+}
+
+function Get-FolderPathMap {
+    # ライブラリ配下のフォルダを浅い階層から順にたどり、「パス -> ContentFolder Id」を作る。
+    #
+    # 以前はこの対応を匿名 Apex の System.debug から拾っていたが、デバッグログは
+    # サイズ上限で切り詰められうえ記号がエスケープされる、壊れやすい経路だった。
+    # SOQL なら件数にも文字種にも左右されないため、そちらへ寄せている。
+    param(
+        [Parameter(Mandatory)][string] $RootId,
+        [Parameter(Mandatory)][int]    $MaxDepth,
+        [string] $Org,
+        [int]    $ChunkSize = 200
+    )
+    $map = @{ '' = $RootId }
+    $frontier = @{ $RootId = '' }
+
+    for ($d = 0; $d -lt $MaxDepth -and $frontier.Count -gt 0; $d++) {
+        $next = @{}
+        foreach ($chunk in (Split-Chunk -Items @($frontier.Keys) -Size $ChunkSize)) {
+            $inList = ($chunk | ForEach-Object { "'$_'" }) -join ','
+            $soql = "SELECT Id, Name, ParentContentFolderId FROM ContentFolder WHERE ParentContentFolderId IN ($inList)"
+            foreach ($r in (Invoke-SfQuery -Soql $soql -Org $Org)) {
+                $base = $frontier[$r.ParentContentFolderId]
+                $path = if ($base -eq '') { $r.Name } else { "$base/$($r.Name)" }
+                $map[$path] = $r.Id
+                $next[$r.Id] = $path
+            }
+        }
+        $frontier = $next
+    }
+    return $map
+}
+
 function Invoke-SfQuery {
     param([string]$Soql, [string]$Org)
     $sfArgs = @('data', 'query', '--query', $Soql, '--json')
@@ -260,16 +308,33 @@ $rootFull = $rootItem.FullName.TrimEnd('\')
 if (-not $LibraryName) { $LibraryName = $rootItem.Name }
 $developerName = ConvertTo-DeveloperName $LibraryName
 
+# 走査は途中で失敗しうる。よくあるのは名前の末尾にスペースやドットが付いたフォルダで、
+# Win32 API がそれを落とすため Get-ChildItem -Recurse が中へ入れない（5.1 で顕著）。
+# 黙って読み飛ばすと移行漏れになるので、拾えなかったパスは必ず表に出す。
+$scanErrors = @()
+$rawFolders = @(Get-ChildItem -LiteralPath $rootFull -Directory -Recurse -ErrorAction SilentlyContinue -ErrorVariable +scanErrors)
+$rawFiles   = @(Get-ChildItem -LiteralPath $rootFull -File -Recurse -ErrorAction SilentlyContinue -ErrorVariable +scanErrors)
+
+if ($scanErrors.Count -gt 0 -and -not $IgnoreScanErrors) {
+    Write-Host ''
+    Write-Host '  走査できなかったパスがあります:' -ForegroundColor Red
+    foreach ($e in ($scanErrors | Select-Object -First 20)) {
+        Write-Host "    - $($e.TargetObject)" -ForegroundColor Red
+    }
+    throw ("走査に失敗したパスが $($scanErrors.Count) 件あります。フォルダ名の末尾にスペースやドットが付いていないか確認してください。" +
+           '移行漏れを承知で続行する場合は -IgnoreScanErrors を指定します。')
+}
+
 # フォルダ: ルートからの相対パスを / 区切りで保持
 $folders = @(
-    Get-ChildItem -LiteralPath $rootFull -Directory -Recurse |
+    $rawFolders |
         ForEach-Object { $_.FullName.Substring($rootFull.Length + 1).Replace('\', '/') } |
         Sort-Object
 )
 
 # ファイル: 相対フォルダパスと物理パスを保持
 $files = @()
-foreach ($f in (Get-ChildItem -LiteralPath $rootFull -File -Recurse)) {
+foreach ($f in $rawFiles) {
     $skip = $false
     foreach ($p in $ExcludePattern) { if ($f.Name -like $p) { $skip = $true; break } }
     if ($skip) { continue }
@@ -352,8 +417,11 @@ if (existing.isEmpty()) {
 
 $logs = Invoke-AnonymousApex -Code $apex -Label '01-create-library' -Org $TargetOrg -ApexDir $apexDir
 $libMarker = @(Get-ApexMarker -Logs $logs -Kind 'LIB')
-if ($libMarker.Count -eq 0) { throw 'ライブラリ ID を取得できませんでした。' }
-$parts        = $libMarker[0] -split '\|'
+if ($libMarker.Count -eq 0) { throw 'ライブラリ ID を取得できませんでした。migration-output/apex/01-create-library.apex を直接実行して確認してください。' }
+$parts = $libMarker[0] -split '\|'
+if ($parts.Count -lt 3) {
+    throw "ライブラリ作成の結果を解釈できませんでした。デバッグログの該当行: $($libMarker[0])"
+}
 $workspaceId  = $parts[0]
 $rootFolderId = $parts[1]
 Write-Host "  ライブラリ    : $workspaceId ($($parts[2]))"
@@ -366,6 +434,10 @@ Write-Host "  ルートフォルダ: $rootFolderId"
 Write-Phase 'Phase 2: フォルダ階層を作成'
 
 $folderPathToId = @{ '' = $rootFolderId }
+
+# 最も深い階層。フォルダを SOQL でたどり直すときの打ち切り深さに使う。
+$maxDepth = 0
+foreach ($f in $folders) { $maxDepth = [math]::Max($maxDepth, ($f -split '/').Count) }
 
 if ($folders.Count -gt 0) {
     # 深さごとにまとめて insert する。DML ステートメント数は階層の深さ分で済む。
@@ -417,17 +489,22 @@ if ($folders.Count -gt 0) {
 "@)
     }
 
-    [void]$sb.AppendLine("for (String k : m.keySet()) { if (k != '') { System.debug('SFMIG|FOLDER|' + k + '|' + m.get(k)); } }")
+    [void]$sb.AppendLine("System.debug('SFMIG|FOLDERS_DONE|' + m.size());")
 
-    $logs = Invoke-AnonymousApex -Code $sb.ToString() -Label '02-create-folders' -Org $TargetOrg -ApexDir $apexDir
-    foreach ($line in (Get-ApexMarker -Logs $logs -Kind 'FOLDER')) {
-        $i = $line.LastIndexOf('|')
-        $folderPathToId[$line.Substring(0, $i)] = $line.Substring($i + 1)
-    }
-    Write-Host "  作成/再利用したフォルダ: $($folderPathToId.Count - 1) / $($folders.Count)"
+    [void](Invoke-AnonymousApex -Code $sb.ToString() -Label '02-create-folders' -Org $TargetOrg -ApexDir $apexDir)
+
+    # 作成したフォルダの ID は SOQL で取り直す。デバッグログから拾わない理由は
+    # Get-FolderPathMap のコメントを参照。
+    # SOQL はライブラリ全体を見るため、今回の対象外のフォルダも含まれうる。両方を出す。
+    $folderPathToId = Get-FolderPathMap -RootId $rootFolderId -MaxDepth $maxDepth -Org $TargetOrg
+    $resolved = @($folders | Where-Object { $folderPathToId.ContainsKey($_) }).Count
+    Write-Host "  今回の対象フォルダ: $resolved / $($folders.Count) を解決 (ライブラリ全体では $($folderPathToId.Count - 1) 件)"
 
     $missing = @($folders | Where-Object { -not $folderPathToId.ContainsKey($_) })
-    if ($missing.Count -gt 0) { throw "フォルダ ID を解決できませんでした: $($missing -join ', ')" }
+    if ($missing.Count -gt 0) {
+        $sample = ($missing | Select-Object -First 10) -join ', '
+        throw "フォルダ ID を解決できませんでした ($($missing.Count) 件)。Salesforce 側でフォルダ名が変換された可能性があります。例: $sample"
+    }
 } else {
     Write-Host '  サブフォルダなし'
 }
@@ -446,37 +523,20 @@ Write-Phase 'Phase 2.5: ライブラリ内の既存ファイルを確認'
 $existingDocs = @{}
 
 if (-not $Force) {
-    $maxDepth = 1
-    foreach ($f in $folders) { $maxDepth = [math]::Max($maxDepth, ($f -split '/').Count) }
-    $scanDepth = $maxDepth + 1
+    # フォルダ ID からパスを逆引きし、各フォルダ直下のファイルを SOQL で拾う。
+    # ここも以前はデバッグログ経由だったが、件数と文字種に左右されない SOQL に変更した。
+    $idToPath = @{}
+    foreach ($k in $folderPathToId.Keys) { $idToPath[$folderPathToId[$k]] = $k }
 
-    $apex = @"
-Id rootId = '$rootFolderId';
-Map<Id, String> pathOf = new Map<Id, String>{ rootId => '' };
-List<Id> frontier = new List<Id>{ rootId };
-for (Integer d = 0; d < $scanDepth && !frontier.isEmpty(); d++) {
-    List<Id> next = new List<Id>();
-    for (ContentFolderItem it : [
-            SELECT Id, Title, FileExtension, ParentContentFolderId, IsFolder
-            FROM ContentFolderItem WHERE ParentContentFolderId IN :frontier]) {
-        String base = pathOf.get(it.ParentContentFolderId);
-        if (it.IsFolder) {
-            pathOf.put(it.Id, (base == '' ? '' : base + '/') + it.Title);
-            next.add(it.Id);
-        } else {
-            String ext = (it.FileExtension == null || it.FileExtension == '') ? '' : '.' + it.FileExtension;
-            System.debug('SFMIG|EXISTING|' + it.Id + '|' + base + '|' + it.Title + ext);
+    foreach ($chunk in (Split-Chunk -Items @($idToPath.Keys) -Size 200)) {
+        $inList = ($chunk | ForEach-Object { "'$_'" }) -join ','
+        $soql = "SELECT Id, Title, FileExtension, ParentContentFolderId FROM ContentFolderItem " +
+                "WHERE ParentContentFolderId IN ($inList) AND IsFolder = false"
+        foreach ($r in (Invoke-SfQuery -Soql $soql -Org $TargetOrg)) {
+            $path = $idToPath[$r.ParentContentFolderId]
+            $ext  = if ($r.FileExtension) { '.' + $r.FileExtension } else { '' }
+            $existingDocs["$path/$($r.Title)$ext"] = $r.Id
         }
-    }
-    frontier = next;
-}
-"@
-    $logs = Invoke-AnonymousApex -Code $apex -Label '03-scan-existing' -Org $TargetOrg -ApexDir $apexDir
-    # 形式: <ContentDocumentId>|<フォルダパス>|<ファイル名>
-    # フォルダパスは空になりうるので、左から 2 回だけ分割する。
-    foreach ($line in (Get-ApexMarker -Logs $logs -Kind 'EXISTING')) {
-        $seg = $line -split '\|', 3
-        if ($seg.Count -eq 3) { $existingDocs["$($seg[1])/$($seg[2])"] = $seg[0] }
     }
     Write-Host "  既存ファイル: $($existingDocs.Count) 件"
 } else {

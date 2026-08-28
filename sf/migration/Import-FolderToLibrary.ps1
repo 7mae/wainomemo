@@ -250,20 +250,75 @@ function Get-OrgConnection {
                'ブラウザでログインしたときの URL と一致するか確認してください。')
     }
 
-    # トークンの有効性をここで確かめる。正しいトークンでも別ホストへ投げると
-    # Salesforce は 401 INVALID_SESSION_ID を返すため、Phase 3 まで進んでから
-    # 全ファイル失敗して初めて気づく、という事態を防ぐ。
-    try {
-        $null = Invoke-RestMethod -Uri "$($conn.InstanceUrl)/services/data/v$($conn.ApiVersion)/limits" `
-                                  -Headers @{ Authorization = "Bearer $($conn.AccessToken)" } -Method Get
-    } catch {
-        throw ("REST API の認証に失敗しました: $(Get-RestErrorDetail $_)`n" +
-               "instanceUrl=$($conn.InstanceUrl) / apiVersion=$($conn.ApiVersion) / user=$($conn.Username)`n" +
-               'INVALID_SESSION_ID の場合は sf org login web --target-org <alias> で認証し直すか、' +
-               'instanceUrl がブラウザでログインしたときの URL と一致するか確認してください。')
+    # 組織によっては sf がアクセストークンを開示せず、伏せ字の説明文を返す。
+    # それを Authorization ヘッダーに載せると INVALID_AUTH_HEADER になるため、
+    # 値がセッション ID の形をしているかどうかで判定し、違えば REST を sf 経由に切り替える。
+    $tokenUsable = ($conn.AccessToken -match '^00D[A-Za-z0-9]{12,15}!') -and ($conn.AccessToken -notmatch '\s')
+    $conn | Add-Member -NotePropertyName UseCliForRest -NotePropertyValue (-not $tokenUsable)
+
+    if ($conn.UseCliForRest) {
+        Write-Host '  注意: sf がアクセストークンを開示しないため、アップロードを sf 経由に切り替えます' -ForegroundColor Yellow
+        Write-Host '        （1 ファイルあたり数秒かかります）' -ForegroundColor Yellow
+    } else {
+        # トークンの有効性をここで確かめる。正しいトークンでも別ホストへ投げると
+        # Salesforce は 401 INVALID_SESSION_ID を返すため、Phase 3 まで進んでから
+        # 全ファイル失敗して初めて気づく、という事態を防ぐ。
+        try {
+            $null = Invoke-RestMethod -Uri "$($conn.InstanceUrl)/services/data/v$($conn.ApiVersion)/limits" `
+                                      -Headers @{ Authorization = "Bearer $($conn.AccessToken)" } -Method Get
+        } catch {
+            throw ("REST API の認証に失敗しました: $(Get-RestErrorDetail $_)`n" +
+                   "instanceUrl=$($conn.InstanceUrl) / apiVersion=$($conn.ApiVersion) / user=$($conn.Username)`n" +
+                   'INVALID_SESSION_ID の場合は sf org login web --target-org <alias> で認証し直すか、' +
+                   'instanceUrl がブラウザでログインしたときの URL と一致するか確認してください。')
+        }
     }
 
     return $conn
+}
+
+function Invoke-ContentVersionCreate {
+    # ContentVersion を 1 件作成し、応答（id を含む）を返す。
+    #
+    # 既定は REST を直接呼ぶ（速い）。sf がアクセストークンを開示しない組織では
+    # sf api request rest を使う。こちらは CLI 自身の認証を使うためトークンを
+    # 取り出す必要がないが、1 件ごとにプロセスを起動するぶん遅い。
+    param(
+        [Parameter(Mandatory)][string] $BodyJson,
+        [Parameter(Mandatory)] $Conn,
+        [string] $Org
+    )
+    if (-not $Conn.UseCliForRest) {
+        return Invoke-RestMethod -Method Post `
+            -Uri "$($Conn.InstanceUrl)/services/data/v$($Conn.ApiVersion)/sobjects/ContentVersion" `
+            -Headers @{ Authorization = "Bearer $($Conn.AccessToken)" } `
+            -ContentType 'application/json; charset=UTF-8' `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes($BodyJson))
+    }
+
+    $tmp = [System.IO.Path]::GetTempFileName()
+    try {
+        [System.IO.File]::WriteAllText($tmp, $BodyJson, (New-Object System.Text.UTF8Encoding $false))
+        $sfArgs = @('api', 'request', 'rest',
+                    "/services/data/v$($Conn.ApiVersion)/sobjects/ContentVersion",
+                    '--body', "@$tmp", '--method', 'POST')
+        if ($Org) { $sfArgs += @('--target-org', $Org) }
+        $raw = Invoke-SfRaw -Arguments $sfArgs
+
+        # 成功時はオブジェクト、失敗時はエラーの配列が返る。先に現れるほうを起点にする。
+        $o = $raw.IndexOf('{')
+        $a = $raw.IndexOf('[')
+        if ($o -lt 0 -and $a -lt 0) { throw "sf api request rest の応答を解析できませんでした: $(Hide-Secret $raw)" }
+        $start = if ($o -ge 0 -and ($a -lt 0 -or $o -lt $a)) { $o } else { $a }
+        $parsed = $raw.Substring($start) | ConvertFrom-Json
+
+        if ($parsed -is [System.Array]) {
+            throw (($parsed | ForEach-Object { "$($_.errorCode): $($_.message)" }) -join ' / ')
+        }
+        return $parsed
+    } finally {
+        if ($tmp -and (Test-Path -LiteralPath $tmp)) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 function Invoke-AnonymousApex {
@@ -628,10 +683,9 @@ if ($skipExisting.Count -gt 0) {
 
 Write-Phase 'Phase 3: ファイルをアップロード'
 
-# 匿名 Apex はローカルファイルを読めないため、ここだけ REST API を直接使う。
+# 匿名 Apex はローカルファイルを読めないため、ここだけ REST API を使う。
 # FirstPublishLocationId にライブラリ ID を渡すとライブラリ直下へ配置される。
-$uploadUrl = "$($conn.InstanceUrl)/services/data/v$($conn.ApiVersion)/sobjects/ContentVersion"
-$headers   = @{ Authorization = "Bearer $($conn.AccessToken)" }
+if ($conn.UseCliForRest) { Write-Host '  sf 経由で送信します（トークン非開示の組織のため）' }
 
 $results = @()
 $n = 0
@@ -650,20 +704,16 @@ foreach ($f in $uploadable) {
             VersionData            = [Convert]::ToBase64String($bytes)
             FirstPublishLocationId = $workspaceId
         } | ConvertTo-Json -Compress
-        # 5.1 の Invoke-RestMethod は文字列 Body を UTF-8 として送らないため、
-        # 日本語のファイル名が化ける。バイト列に変換して渡す。
-        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
         try {
-            $resp = Invoke-RestMethod -Method Post -Uri $uploadUrl -Headers $headers -ContentType 'application/json; charset=UTF-8' -Body $bodyBytes
+            $resp = Invoke-ContentVersionCreate -BodyJson $body -Conn $conn -Org $TargetOrg
         } catch {
             # 401 は長時間実行中のセッション失効で起こりうる。
             # トークンを取り直して 1 回だけ再送する。それでも駄目なら通常の失敗として扱う。
-            if ((Get-RestStatus $_) -ne 401) { throw }
+            # sf 経由の場合は CLI 側が認証を面倒みるため、この再試行は不要。
+            if ($conn.UseCliForRest -or (Get-RestStatus $_) -ne 401) { throw }
             Write-Host '  401 を受けたためトークンを取り直して再送します' -ForegroundColor Yellow
-            $conn      = Get-OrgConnection -Org $TargetOrg
-            $uploadUrl = "$($conn.InstanceUrl)/services/data/v$($conn.ApiVersion)/sobjects/ContentVersion"
-            $headers   = @{ Authorization = "Bearer $($conn.AccessToken)" }
-            $resp = Invoke-RestMethod -Method Post -Uri $uploadUrl -Headers $headers -ContentType 'application/json; charset=UTF-8' -Body $bodyBytes
+            $conn = Get-OrgConnection -Org $TargetOrg
+            $resp = Invoke-ContentVersionCreate -BodyJson $body -Conn $conn -Org $TargetOrg
         }
         $versionId = $resp.id
         $consecutiveAuthFailures = 0

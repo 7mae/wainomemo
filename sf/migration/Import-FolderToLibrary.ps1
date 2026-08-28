@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     ローカルのフォルダ階層を Salesforce のコンテンツライブラリへ移行する。
 
@@ -69,6 +69,12 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# Windows PowerShell 5.1 は既定で TLS 1.0/1.1 を使うことがあり、Salesforce に接続できない。
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    [System.Net.ServicePointManager]::SecurityProtocol =
+        [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+}
+
 # 匿名 Apex 1 実行あたりに詰め込む件数。スクリプト長と SOQL/DML 行数の両方に余裕を持たせている。
 $MoveChunkSize  = 400
 $QueryChunkSize = 300
@@ -119,20 +125,51 @@ function ConvertTo-ApexString {
     return $Text.Replace('\', '\\').Replace("'", "\'").Replace("`r", '').Replace("`n", '\n')
 }
 
+function Hide-Secret {
+    # sf の応答にはアクセストークンが含まれる。エラーメッセージにそのまま載せると
+    # コンソールやログに漏れるため、必ずマスクしてから表示する。
+    param([string]$Text)
+    if ($null -eq $Text) { return '' }
+    $masked = $Text -replace '(?<="accessToken"\s*:\s*")[^"]+', '<redacted>'
+    return $masked -replace '00D[A-Za-z0-9]{12,15}![^"\s,]+', '<redacted>'
+}
+
+function Invoke-SfRaw {
+    # sf を呼び出して標準出力だけを文字列で返す。
+    #
+    # Windows PowerShell 5.1 特有の落とし穴が 2 つある。
+    #   1. ErrorActionPreference='Stop' だと、ネイティブコマンドが標準エラーに何か
+    #      出しただけで NativeCommandError になる。sf は更新通知を標準エラーに出す。
+    #   2. 2>&1 で標準エラーを混ぜて Out-String に通すと、コンソール幅で折り返されて
+    #      JSON が改行と空白で分断され、解析できなくなる。
+    # そのため標準エラーはファイルへ逃がし、標準出力は Out-String を使わず素直に連結する。
+    param([string[]]$Arguments)
+    $errFile = [System.IO.Path]::GetTempFileName()
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $lines = & sf @Arguments 2>$errFile
+        return ($lines -join "`n")
+    } finally {
+        $ErrorActionPreference = $prev
+        Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function ConvertFrom-SfJson {
     # sf は JSON の前に更新通知などの警告行を出すことがあるため、最初の { 以降だけを取り出す。
     param([string]$Raw, [string]$Context)
     $i = $Raw.IndexOf('{')
-    if ($i -lt 0) { throw "$Context の応答に JSON が含まれていませんでした。`n$Raw" }
+    if ($i -lt 0) { throw "$Context の応答に JSON が含まれていませんでした。`n$(Hide-Secret $Raw)" }
     try { return $Raw.Substring($i) | ConvertFrom-Json }
-    catch { throw "$Context の応答を解析できませんでした。`n$Raw" }
+    catch { throw "$Context の応答を解析できませんでした。`n$(Hide-Secret $Raw)" }
 }
 
 function Get-OrgConnection {
     param([string]$Org)
     $sfArgs = @('org', 'display', '--json')
     if ($Org) { $sfArgs += @('--target-org', $Org) }
-    $raw = & sf @sfArgs 2>$null | Out-String
+    $raw = Invoke-SfRaw -Arguments $sfArgs
     $j = ConvertFrom-SfJson -Raw $raw -Context 'sf org display'
     if ($j.status -ne 0) { throw "組織情報の取得に失敗しました (status=$($j.status))。" }
 
@@ -160,16 +197,19 @@ function Invoke-AnonymousApex {
         [Parameter(Mandatory)][string] $ApexDir
     )
     $file = Join-Path $ApexDir "$Label.apex"
-    Set-Content -Path $file -Value $Code -Encoding UTF8
+    # Set-Content -Encoding UTF8 は 5.1 では BOM 付き、7 では BOM なしと挙動が割れる。
+    # BOM が付くと Apex ソースの先頭が非 ASCII 文字になりコンパイルが通らないため、
+    # バージョンに依存しない .NET の API で BOM なし UTF-8 を明示的に書く。
+    [System.IO.File]::WriteAllText($file, $Code, (New-Object System.Text.UTF8Encoding $false))
 
     $sfArgs = @('apex', 'run', '--file', $file, '--json')
     if ($Org) { $sfArgs += @('--target-org', $Org) }
-    $raw = & sf @sfArgs 2>$null | Out-String
+    $raw = Invoke-SfRaw -Arguments $sfArgs
     $j = ConvertFrom-SfJson -Raw $raw -Context "sf apex run ($Label / 生成物: $file)"
 
     # sf がコマンド自体で失敗した場合、応答に result は含まれず message だけが返る。
     if ($j.PSObject.Properties.Name -notcontains 'result') {
-        $msg = if ($j.PSObject.Properties.Name -contains 'message') { $j.message } else { $raw }
+        $msg = if ($j.PSObject.Properties.Name -contains 'message') { $j.message } else { Hide-Secret $raw }
         throw "sf apex run が失敗しました ($Label): $msg`n生成物: $file"
     }
     $r = $j.result
@@ -199,7 +239,7 @@ function Invoke-SfQuery {
     param([string]$Soql, [string]$Org)
     $sfArgs = @('data', 'query', '--query', $Soql, '--json')
     if ($Org) { $sfArgs += @('--target-org', $Org) }
-    $raw = & sf @sfArgs 2>$null | Out-String
+    $raw = Invoke-SfRaw -Arguments $sfArgs
     $j = ConvertFrom-SfJson -Raw $raw -Context 'sf data query'
     if ($j.status -ne 0) { throw "SOQL の実行に失敗しました: $Soql" }
     if ($j.result.totalSize -eq 0) { return @() }
@@ -476,7 +516,10 @@ foreach ($f in $uploadable) {
             VersionData            = [Convert]::ToBase64String($bytes)
             FirstPublishLocationId = $workspaceId
         } | ConvertTo-Json -Compress
-        $resp = Invoke-RestMethod -Method Post -Uri $uploadUrl -Headers $headers -ContentType 'application/json; charset=UTF-8' -Body $body
+        # 5.1 の Invoke-RestMethod は文字列 Body を UTF-8 として送らないため、
+        # 日本語のファイル名が化ける。バイト列に変換して渡す。
+        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+        $resp = Invoke-RestMethod -Method Post -Uri $uploadUrl -Headers $headers -ContentType 'application/json; charset=UTF-8' -Body $bodyBytes
         $versionId = $resp.id
     } catch {
         $status = 'Failed'
@@ -585,12 +628,15 @@ Write-Phase 'Phase 5: 結果を CSV に出力'
 
 $stamp   = Get-Date -Format 'yyyyMMdd-HHmmss'
 $csvPath = Join-Path $OutDir "$developerName-$stamp.csv"
-$results |
+# Export-Csv -Encoding UTF8 も 5.1 と 7 で BOM の有無が割れる。
+# CSV は Excel で開かれる前提なので、日本語が化けないよう BOM 付きで統一する。
+$csvText = $results |
     Select-Object @{ n = 'LibraryName'; e = { $LibraryName } },
                   FolderPath, FileName, RelPath, SizeBytes,
                   ContentDocumentId, ContentVersionId, FolderId, Status, Error |
     Sort-Object FolderPath, FileName |
-    Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+    ConvertTo-Csv -NoTypeInformation
+[System.IO.File]::WriteAllLines($csvPath, [string[]]$csvText, (New-Object System.Text.UTF8Encoding $true))
 
 Write-Host "  出力: $csvPath"
 Write-Host ''

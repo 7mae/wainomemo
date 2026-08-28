@@ -139,6 +139,36 @@ function Hide-Secret {
     return $masked -replace '00D[A-Za-z0-9]{12,15}![^"\s,]+', '<redacted>'
 }
 
+function Get-RestStatus {
+    # Invoke-RestMethod の例外から HTTP ステータスコードを取り出す。取れなければ $null。
+    param($ErrorRecord)
+    try { return $ErrorRecord.Exception.Response.StatusCode.value__ } catch { return $null }
+}
+
+function Get-RestErrorDetail {
+    # Invoke-RestMethod の例外から HTTP ステータスと Salesforce の応答本文を取り出す。
+    # 応答本文には errorCode（INVALID_SESSION_ID や REQUIRED_FIELD_MISSING など）が入っており、
+    # これがないと認証の問題かリクエスト内容の問題かを切り分けられない。
+    # 本文の取得経路は 5.1 と 7 で異なるため両方を試す。
+    param($ErrorRecord)
+    $status = Get-RestStatus $ErrorRecord
+    $body = ''
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+        $body = $ErrorRecord.ErrorDetails.Message          # PowerShell 7
+    } else {
+        try {                                              # Windows PowerShell 5.1
+            $stream = $ErrorRecord.Exception.Response.GetResponseStream()
+            $reader = New-Object System.IO.StreamReader($stream)
+            $body = $reader.ReadToEnd()
+            $reader.Dispose()
+        } catch { $body = '' }
+    }
+    $body = ($body -replace '\s+', ' ').Trim()
+    if ($status -and $body) { return "HTTP $status $body" }
+    if ($status) { return "HTTP $status $($ErrorRecord.Exception.Message)" }
+    return $ErrorRecord.Exception.Message
+}
+
 function Invoke-SfRaw {
     # sf を呼び出して標準出力だけを文字列で返す。
     #
@@ -199,12 +229,41 @@ function Get-OrgConnection {
     }
     $apiVersion = if ($props -contains 'apiVersion' -and $j.result.apiVersion) { $j.result.apiVersion } else { '67.0' }
 
-    [pscustomobject]@{
+    $conn = [pscustomobject]@{
         InstanceUrl = $j.result.instanceUrl.TrimEnd('/')
         AccessToken = $j.result.accessToken
         ApiVersion  = $apiVersion
         Username    = $j.result.username
     }
+
+    # この org が実際に提供する API バージョンを採用する。
+    # sf org display の apiVersion はプロジェクトローカルの org-api-version 設定に
+    # 引きずられるため、対象 org が対応していないバージョンを返すことがある。
+    # /services/data/ は認証不要なので、ここではホストの妥当性だけが分かる。
+    try {
+        $versions = Invoke-RestMethod -Uri "$($conn.InstanceUrl)/services/data/" -Method Get
+        $latest = ($versions | Select-Object -Last 1).version
+        if ($latest) { $conn.ApiVersion = $latest }
+    } catch {
+        throw ("組織のホストへ到達できませんでした: $(Get-RestErrorDetail $_)`n" +
+               "instanceUrl=$($conn.InstanceUrl)`n" +
+               'ブラウザでログインしたときの URL と一致するか確認してください。')
+    }
+
+    # トークンの有効性をここで確かめる。正しいトークンでも別ホストへ投げると
+    # Salesforce は 401 INVALID_SESSION_ID を返すため、Phase 3 まで進んでから
+    # 全ファイル失敗して初めて気づく、という事態を防ぐ。
+    try {
+        $null = Invoke-RestMethod -Uri "$($conn.InstanceUrl)/services/data/v$($conn.ApiVersion)/limits" `
+                                  -Headers @{ Authorization = "Bearer $($conn.AccessToken)" } -Method Get
+    } catch {
+        throw ("REST API の認証に失敗しました: $(Get-RestErrorDetail $_)`n" +
+               "instanceUrl=$($conn.InstanceUrl) / apiVersion=$($conn.ApiVersion) / user=$($conn.Username)`n" +
+               'INVALID_SESSION_ID の場合は sf org login web --target-org <alias> で認証し直すか、' +
+               'instanceUrl がブラウザでログインしたときの URL と一致するか確認してください。')
+    }
+
+    return $conn
 }
 
 function Invoke-AnonymousApex {
@@ -576,6 +635,7 @@ $headers   = @{ Authorization = "Bearer $($conn.AccessToken)" }
 
 $results = @()
 $n = 0
+$consecutiveAuthFailures = 0
 foreach ($f in $uploadable) {
     $n++
     Write-Progress -Activity 'アップロード中' -Status "$n / $($uploadable.Count)  $($f.RelPath)" -PercentComplete ([int](100 * $n / [math]::Max($uploadable.Count, 1)))
@@ -593,12 +653,39 @@ foreach ($f in $uploadable) {
         # 5.1 の Invoke-RestMethod は文字列 Body を UTF-8 として送らないため、
         # 日本語のファイル名が化ける。バイト列に変換して渡す。
         $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
-        $resp = Invoke-RestMethod -Method Post -Uri $uploadUrl -Headers $headers -ContentType 'application/json; charset=UTF-8' -Body $bodyBytes
+        try {
+            $resp = Invoke-RestMethod -Method Post -Uri $uploadUrl -Headers $headers -ContentType 'application/json; charset=UTF-8' -Body $bodyBytes
+        } catch {
+            # 401 は長時間実行中のセッション失効で起こりうる。
+            # トークンを取り直して 1 回だけ再送する。それでも駄目なら通常の失敗として扱う。
+            if ((Get-RestStatus $_) -ne 401) { throw }
+            Write-Host '  401 を受けたためトークンを取り直して再送します' -ForegroundColor Yellow
+            $conn      = Get-OrgConnection -Org $TargetOrg
+            $uploadUrl = "$($conn.InstanceUrl)/services/data/v$($conn.ApiVersion)/sobjects/ContentVersion"
+            $headers   = @{ Authorization = "Bearer $($conn.AccessToken)" }
+            $resp = Invoke-RestMethod -Method Post -Uri $uploadUrl -Headers $headers -ContentType 'application/json; charset=UTF-8' -Body $bodyBytes
+        }
         $versionId = $resp.id
+        $consecutiveAuthFailures = 0
     } catch {
         $status = 'Failed'
-        $errMsg = $_.Exception.Message
+        $errMsg = Get-RestErrorDetail $_
         Write-Host "  失敗: $($f.RelPath) - $errMsg" -ForegroundColor Red
+
+        # 認証が通らない状態で数千件を延々と試すのは無駄なので、続けて失敗したら打ち切る。
+        if ((Get-RestStatus $_) -eq 401) {
+            $consecutiveAuthFailures++
+            if ($consecutiveAuthFailures -ge 5) {
+                Write-Progress -Activity 'アップロード中' -Completed
+                throw ("認証エラーが $consecutiveAuthFailures 件続いたため中断しました。`n" +
+                       "最後のエラー: $errMsg`n" +
+                       "instanceUrl=$($conn.InstanceUrl) / user=$($conn.Username)`n" +
+                       'INVALID_SESSION_ID なら、instanceUrl がブラウザでログインしたときの URL と' +
+                       '一致するか、組織のセッション設定（発信元 IP への固定など）を確認してください。')
+            }
+        } else {
+            $consecutiveAuthFailures = 0
+        }
     }
     $results += [pscustomobject]@{
         FolderPath        = $f.FolderPath

@@ -149,14 +149,28 @@ function Invoke-SfRaw {
     #      JSON が改行と空白で分断され、解析できなくなる。
     # そのため標準エラーはファイルへ逃がし、標準出力は Out-String を使わず素直に連結する。
     param([string[]]$Arguments)
-    $errFile = [System.IO.Path]::GetTempFileName()
-    $prev = $ErrorActionPreference
+    $errFile  = [System.IO.Path]::GetTempFileName()
+    $prevPref = $ErrorActionPreference
+    $prevEnc  = $null
     $ErrorActionPreference = 'Continue'
     try {
+        # sf は UTF-8 で出力するが、PowerShell はネイティブコマンドの出力を
+        # [Console]::OutputEncoding で復号する。日本語 Windows のコンソールは既定が
+        # CP932 なので、そのままだと日本語が化けたうえ JSON 自体が壊れて解析に失敗する。
+        # 呼び出しの間だけ UTF-8 に切り替え、元の設定へ必ず戻す。
+        try {
+            $prevEnc = [Console]::OutputEncoding
+            [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+        } catch {
+            # コンソールが割り当てられていない場合は設定できない。
+            # その状況では既定で UTF-8 として扱われるため実害はない。
+            $prevEnc = $null
+        }
         $lines = & sf @Arguments 2>$errFile
         return ($lines -join "`n")
     } finally {
-        $ErrorActionPreference = $prev
+        if ($null -ne $prevEnc) { try { [Console]::OutputEncoding = $prevEnc } catch {} }
+        $ErrorActionPreference = $prevPref
         Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
     }
 }

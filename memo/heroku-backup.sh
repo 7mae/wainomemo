@@ -3,6 +3,7 @@
 #   使い方: ./heroku-backup.sh [TEAM名]
 #   前提  : heroku CLI ログイン済み, jq, curl
 #   環境変数: SKIP_PG=1 で Postgres のダンプ取得をスキップ
+heroku() { heroku.cmd "$@"; }
 set -uo pipefail
 
 TEAM="${1:-}"
@@ -27,12 +28,12 @@ run "$OUT/team/pipelines.json" heroku pipelines --json
 [[ -n "$TEAM" ]] && run "$OUT/team/members.json" heroku members --team "$TEAM" --json
 
 echo "== Pipelines =="
-for p in $(jq -r '.[].name' "$OUT/team/pipelines.json" 2>/dev/null); do
+for p in $(jq -r '.[].name' "$OUT/team/pipelines.json" 2>/dev/null | tr -d '\r'); do
   run "$OUT/pipelines/${p}.json" heroku pipelines:info "$p" --json
 done
 
 echo "== Private Spaces =="
-for s in $(jq -r '.[].name' "$OUT/team/spaces.json" 2>/dev/null); do
+for s in $(jq -r '.[].name' "$OUT/team/spaces.json" 2>/dev/null | tr -d '\r'); do
   d="$OUT/spaces/$s"; mkdir -p "$d"
   run "$d/info.json"            heroku spaces:info --space "$s" --json
   run "$d/topology.json"        heroku spaces:topology --space "$s" --json
@@ -44,7 +45,7 @@ for s in $(jq -r '.[].name' "$OUT/team/spaces.json" 2>/dev/null); do
 done
 
 echo "== Apps =="
-for a in $(jq -r '.[].name' "$OUT/team/apps.json"); do
+for a in $(jq -r '.[].name' "$OUT/team/apps.json" | tr -d '\r'); do
   echo "-- $a"
   d="$OUT/apps/$a"; mkdir -p "$d"
   run "$d/info.json"        heroku apps:info -a "$a" --json
@@ -65,18 +66,18 @@ for a in $(jq -r '.[].name' "$OUT/team/apps.json"); do
   run "$d/stack.txt"        heroku stack -a "$a"
 
   # アドオンごとの詳細
-  for ad in $(jq -r '.[].name' "$d/addons.json" 2>/dev/null); do
+  for ad in $(jq -r '.[].name' "$d/addons.json" 2>/dev/null | tr -d '\r'); do
     run "$d/addon-${ad}.txt" heroku addons:info "$ad" -a "$a"
   done
 
   # Postgres: バックアップ取得 → ダウンロード（アプリ/アドオン削除でHeroku側のバックアップも消える）
   if [[ "${SKIP_PG:-0}" != "1" ]]; then
-    for db in $(jq -r '.[] | select(.addon_service.name=="heroku-postgresql") | .name' "$d/addons.json" 2>/dev/null); do
+    for db in $(jq -r '.[] | select(.addon_service.name=="heroku-postgresql") | .name' "$d/addons.json" 2>/dev/null | tr -d '\r'); do
       echo "   pg backup: $db"
       run "$d/pg-info-${db}.txt"        heroku pg:info "$db" -a "$a"
       run "$d/pg-credentials-${db}.txt" heroku pg:credentials "$db" -a "$a"
       if heroku pg:backups:capture "$db" -a "$a"; then
-        url="$(heroku pg:backups:url -a "$a")"
+        url="$(heroku pg:backups:url -a "$a" | tr -d '\r')"
         curl -fsSL -o "$d/${db}.dump" "$url" || echo "WARN: download failed $a/$db" | tee -a "$OUT/warnings.log"
         command -v pg_restore >/dev/null && pg_restore --list "$d/${db}.dump" > "$d/${db}.dump.list" 2>&1
       else
